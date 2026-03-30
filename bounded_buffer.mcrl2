@@ -282,7 +282,9 @@ proc
 % of the next item index, if it is a valid producer tid, it signals it to wake up.
 % otherwise, it does nothing (i.e. no producer has yet claimed the next item)
 
-% BROADCAST-BASED PRODUCER
+% register entries in signal solution
+sort
+	CoordEntry = struct ce(item: Item, owner: Tid);
 act
 	buf_put_p: Item;
 	request_i_p: Tid;
@@ -295,18 +297,21 @@ act
 	incr_prod;
 	read_counter_prod_full;
 	read_counter_prod_nonfull;
-	ack_insertion_p;
-	ack_insertion_t;
+	ack_insertion_s;
+	ack_insertion_r;
 	ack_insertion;
+	reg_coord_r, reg_coord_s, reg_coord: CoordEntry;
+	coord_sig_r, coord_sig_s, coord_sig: CoordEntry;
 
 proc
+	% BROADCAST-BASED PRODUCER
 	% Turn enables exactly one next item value at a time.
 	Turn(expected: Item) =
-		(expected < NROF_ITEMS) -> pass_r(expected) . ack_insertion_t . Turn(expected + 1)
+		(expected < NROF_ITEMS) -> pass_r(expected) . ack_insertion_r . Turn(expected + 1)
 		+
 		(expected == NROF_ITEMS) -> delta;
 
-	Producer(tid: Tid) =
+	Producer_broadcast(tid: Tid) =
 		request_i_p(tid) .
 		sum job_x: Item. (job_x <= NROF_ITEMS) ->
 			reply_i_p(tid, job_x) .
@@ -315,16 +320,48 @@ proc
 				<>
 				(job_x < NROF_ITEMS) ->
 					pass_s(job_x) .
-					Producer_BufferTry(tid, job_x)
+					Producer_BufferTry(tid, job_x, true)
 			);
 
-	Producer_BufferTry(tid: Tid, job_x: Item) =
+	% SIGNAL-BASED PRODUCER
+	% Coord subroutine registers mappings and signals turn
+	Coord(e: Item, O: FSet(CoordEntry)) =
+		(e == NROF_ITEMS) -> delta
+		<>
+		(e < NROF_ITEMS) ->
+			(
+				sum x: Item, i: Tid.
+				(x < NROF_ITEMS && i < NROF_PRODUCERS) ->
+					reg_coord_r(ce(x, i)) .
+					Coord(e, O + {ce(x, i)})
+				+
+				sum i: Tid.
+				(ce(e, i) in O) ->
+					coord_sig_s(ce(e, i)) .
+					ack_insertion_r .
+					Coord(e + 1, O - {ce(e, i)})
+			);
+	
+	Producer_signal(tid: Tid) =
+		request_i_p(tid) .
+		sum job_x: Item. (job_x <= NROF_ITEMS) ->
+			reply_i_p(tid, job_x) .
+			(
+				(job_x == NROF_ITEMS) -> delta
+				<>
+				(job_x < NROF_ITEMS) ->
+					reg_coord_s(ce(job_x, tid)) .
+					coord_sig_r(ce(job_x, tid)) .
+					Producer_BufferTry(tid, job_x, false)
+			);
+		
+	Producer_BufferTry(tid: Tid, job_x: Item, broadcast: Bool) =
 		req_b_s(tid) . grant_b_s(tid) .
 		(
 			read_counter_prod_full .
 			rel_req_s(tid) .
 			wait_NotFull_p .
-			Producer_BufferTry(tid, job_x)
+			Producer_BufferTry(tid, job_x, broadcast)
 			+
 			read_counter_prod_nonfull .
 			tau .
@@ -332,18 +369,35 @@ proc
 			incr_prod .
 			rel_req_s(tid) .
 			signal_NotEmpty_p .
-			ack_insertion_p .
-			Producer(tid)
+			ack_insertion_s .
+			(broadcast) -> Producer_broadcast(tid) 
+			<>
+			(!broadcast) -> Producer_signal(tid)
 		);
 
+	% BROADCAST SOLUTION ENTRY-POINT
 	Broadcast_P =
 		hide({pass, ack_insertion},
 		allow({request_i_p, reply_i_p, req_b_s, grant_b_s, rel_req_s, buf_put_p, wait_NotFull_p, signal_NotEmpty_p,
 		incr_prod, read_counter_prod_full, read_counter_prod_nonfull, pass, ack_insertion},
 		comm({ pass_s | pass_r -> pass,
-			   ack_insertion_t | ack_insertion_p -> ack_insertion
+			   ack_insertion_r | ack_insertion_s -> ack_insertion
 			},
-		     Producer(0) || Producer(1) || Turn(0)
+		     Producer_broadcast(0) || Producer_broadcast(1) || Turn(0)
+		)));
+
+	% SIGNAL SOLUTION ENTRY-POINT
+	Signal_P =
+		hide({reg_coord, coord_sig, ack_insertion},
+		allow({request_i_p, reply_i_p, req_b_s, grant_b_s, rel_req_s, buf_put_p, wait_NotFull_p, signal_NotEmpty_p,
+		incr_prod, read_counter_prod_full, read_counter_prod_nonfull,
+		reg_coord, coord_sig, ack_insertion
+		},
+		comm({ reg_coord_r | reg_coord_s -> reg_coord,
+			   coord_sig_r | coord_sig_s -> coord_sig,
+			   ack_insertion_r | ack_insertion_s -> ack_insertion
+			},
+		     Producer_signal(0) || Producer_signal(1) || Coord(0, {})
 		)));
 
 
@@ -354,18 +408,30 @@ act
 	request_i: Tid;
 	reply_i: Tid # Item;
 proc
-	P_GNI =
+	P_GNI_B =
 		hide({request_i, reply_i},
-		allow({request_i, reply_i, pass, ack_insertion,
-		req_b_s, grant_b_s, rel_req_s, buf_put_p, wait_NotFull_p, signal_NotEmpty_p,
+		allow({request_i, reply_i, req_b_s, grant_b_s, rel_req_s, buf_put_p, wait_NotFull_p, signal_NotEmpty_p,
 		incr_prod, read_counter_prod_full, read_counter_prod_nonfull,
 		% GNI server actions
 		acquire_gni, release_gni
 		},
 		comm({ request_i_f | request_i_p -> request_i,
 		       reply_i_f | reply_i_p -> reply_i
-		     },
-		     GNI || Broadcast_P
+		    },
+		    GNI || Broadcast_P
+		)));
+
+	P_GNI_S =
+		hide({request_i, reply_i},
+		allow({request_i, reply_i, req_b_s, grant_b_s, rel_req_s, buf_put_p, wait_NotFull_p, signal_NotEmpty_p,
+		incr_prod, read_counter_prod_full, read_counter_prod_nonfull,
+		% GNI server actions
+		acquire_gni, release_gni
+		},
+		comm({ request_i_f | request_i_p -> request_i,
+		       reply_i_f | reply_i_p -> reply_i
+		    },
+		    GNI || Signal_P
 		)));
 
 % COUNTER, PRODUCER and CONSUMER
@@ -379,13 +445,11 @@ act
 	NotEmpty;
 	NotFull;
 proc
-	P_B_Counter =
+	P_B_Counter_B =
 		hide({decr, incr, read_counter_zero, read_counter_nonzero, read_counter_full, read_counter_nonfull, NotEmpty, NotFull, signal_NotEmpty_p, signal_NotFull_c},
 		allow({print, decr, incr, read_counter_zero, read_counter_nonzero, read_counter_full, read_counter_nonfull,
 		req_b_s, grant_b_s, rel_req_s, buf_put_p, buf_take_c, NotEmpty, NotFull,
-	    % P_GNI actions
-		request_i, reply_i, pass, ack_insertion, acquire_gni, release_gni,
-		% Signal actions
+	    % Signal actions
 		signal_NotEmpty_p, signal_NotFull_c
 		 },
 		 comm({ incr_prod | incr_c -> incr,
@@ -397,7 +461,26 @@ proc
 				signal_NotEmpty_p | wait_NotEmpty_c -> NotEmpty,
 				signal_NotFull_c | wait_NotFull_p -> NotFull
 		     },
-		     P_GNI || Counter(0) || Consumer(0)
+		     P_GNI_B || Counter(0) || Consumer(0)
+		 )));
+
+	P_B_Counter_S =
+		hide({decr, incr, read_counter_zero, read_counter_nonzero, read_counter_full, read_counter_nonfull, NotEmpty, NotFull, signal_NotEmpty_p, signal_NotFull_c},
+		allow({print, decr, incr, read_counter_zero, read_counter_nonzero, read_counter_full, read_counter_nonfull,
+		req_b_s, grant_b_s, rel_req_s, buf_put_p, buf_take_c, NotEmpty, NotFull,
+	    % Signal actions
+		signal_NotEmpty_p, signal_NotFull_c
+		 },
+		 comm({ incr_prod | incr_c -> incr,
+		        decr_cons | decr_c -> decr,
+		        read_counter_prod_full | read_counter_c_full -> read_counter_full,
+		        read_counter_prod_nonfull | read_counter_c_nonfull -> read_counter_nonfull,
+		        read_counter_cons_zero | read_counter_c_zero -> read_counter_zero,
+		        read_counter_cons_nonzero | read_counter_c_nonzero -> read_counter_nonzero,
+				signal_NotEmpty_p | wait_NotEmpty_c -> NotEmpty,
+				signal_NotFull_c | wait_NotFull_p -> NotFull
+		     },
+		     P_GNI_S || Counter(0) || Consumer(0)
 		 )));
 
 % P_B_Counter - BUFFER MONITOR - CIRCULAR BUFFER
@@ -408,27 +491,31 @@ act
 	grant_b: Tid;
 	rel_req: Tid;
 proc 
-	System =
-		hide({req_b, grant_b, rel_req, buf_put, buf_take, signal_NotEmpty_p, signal_NotFull_c},
-		allow({print, req_b, grant_b, rel_req, buf_put, buf_take,
-		% P_B_Counter actions
-		decr, incr, read_counter_zero, read_counter_nonzero, read_counter_full, read_counter_nonfull, NotEmpty, NotFull,
-		% P_GNI actions
-		request_i, reply_i, pass, ack_insertion, acquire_gni, release_gni,
-		% Buffer_Monitor actions
-		acquire_b, release_b,
-		% Signal actions
-		signal_NotEmpty_p, signal_NotFull_c
-		},
+	System_B =
+		hide({req_b, grant_b, rel_req, buf_put, buf_take},
+		allow({print, req_b, grant_b, rel_req, buf_put, buf_take},
 		comm({ buf_put_p | buf_put_b -> buf_put,
 		       buf_take_c | buf_take_b -> buf_take,
 			   req_b_s | req_b_r -> req_b,
 			   grant_b_s | grant_b_r -> grant_b,
 			   rel_req_s | rel_req_r -> rel_req
 		     },
-		     P_B_Counter || 
+		     P_B_Counter_B || 
 			 Buffer_Monitor || Circular_Buffer(0, 0, init_cells(BUFFER_SIZE))
 		)));
 
+	System_S =
+		hide({req_b, grant_b, rel_req, buf_put, buf_take},
+		allow({print, req_b, grant_b, rel_req, buf_put, buf_take},
+		comm({ buf_put_p | buf_put_b -> buf_put,
+		       buf_take_c | buf_take_b -> buf_take,
+			   req_b_s | req_b_r -> req_b,
+			   grant_b_s | grant_b_r -> grant_b,
+			   rel_req_s | rel_req_r -> rel_req
+		     },
+		     P_B_Counter_S || 
+			 Buffer_Monitor || Circular_Buffer(0, 0, init_cells(BUFFER_SIZE))
+		)));
 
-init System || Print_Order(0);
+% Use System_B for broadcast and System_S for signal.
+init System_S || Print_Order(0);
