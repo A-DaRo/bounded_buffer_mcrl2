@@ -1,0 +1,434 @@
+% In this bounded buffer exercise we are requested to model a system with P producers and one consumer.
+% The buffer has a fixed size B. Items are expected to be processed in order, i.e. no item at the bottom of the buffer can be higher than the above.
+% Producers obtain items from a `get_next_item` function modelled to always yield a distinct item and
+% if at iteration c-P the current c lowest item has not being yield, the function returns it.
+
+% --------------
+% VARIABLES, CONSTANTS, STRUCTURES
+% --------------
+% Let the global constants, variables and structures be defined as follows:
+% Global sorts:
+sort
+	Item = Nat; 
+	Tid = Nat;
+	Issued = FSet(Item);
+	GNIWait = FSet(Tid);
+
+% Global constants and variables:
+map
+	NROF_ITEMS: Nat;
+	NROF_PRODUCERS: Nat;
+	BUFFER_SIZE: Nat;
+	required: Nat -> Item;
+
+var
+	c: Nat;
+
+eqn
+	NROF_ITEMS = 3;
+	NROF_PRODUCERS = 2;
+	BUFFER_SIZE = 2;
+
+	% The fairness rule's required job when c > NROF_PRODUCERS.
+	(c > NROF_PRODUCERS) -> required(c) = Int2Nat(c - NROF_PRODUCERS);
+	(c <= NROF_PRODUCERS) -> required(c) = 0;
+
+
+% --------------
+% PROCESSES DEFINITIONS
+% -------------
+
+% EXTERNAL VISIBLE BEHAVIOR
+% from a behavioral perspective, the system looks as follows:
+act print: Item;
+proc Print_Order(k: Item) = (k < NROF_ITEMS) -> print(k).Print_Order(k+1) + (k == NROF_ITEMS) -> delta;
+% init Print_Order(0);
+
+
+% GET NEXT ITEM FUNCTION
+act
+	request_i_f: Tid;
+	reply_i_f: Tid # Item;
+	acquire_s;
+	acquire_r;
+	release_s;
+	release_r;
+	acquire_gni;
+	release_gni;
+
+proc
+    % ItemLock ensures that only one producer can obtain an item at a time.
+    % Note: lock synchronisation is enforced by comm'ing acquire_s|acquire_r and release_s|release_r.
+    ItemLock(locked: Bool) =
+        (!locked) -> acquire_r . ItemLock(true)
+        + (locked)  -> release_r . ItemLock(false);
+
+	% Server maintains the shared state (c, S) and a set of waiting producers.
+	Server(c: Nat, S: Issued, wait: GNIWait) =
+		  sum q: Tid. (q < NROF_PRODUCERS && !(q in wait)) -> request_i_f(q) . Server(c, S, wait + {q})
+		+ (wait != {}) -> acquire_s . BeginServe(pick(wait), c, S, wait);
+
+	% Begin servicing the chosen producer. We remove it from the waiting set once,
+	BeginServe(Tid: Tid, c: Nat, S: Issued, wait: GNIWait) =
+		Serving(Tid, c, S, wait - {Tid});
+
+	% While serving Tid, we still accept further requests (which only update wait).
+	Serving(Tid: Tid, c: Nat, S: Issued, wait: GNIWait) =
+		  sum q: Tid. (q < NROF_PRODUCERS && !(q in wait) && q != Tid) -> request_i_f(q) . Serving(Tid, c, S, wait + {q})
+		+ Eval(Tid, c + 1, S, wait);
+
+	% Pick any not-yet-issued job x in 0..NROF_ITEMS-1.
+	PickUnissued(Tid: Tid, c: Nat, S: Issued, wait: GNIWait) =
+		sum x: Item. (x < NROF_ITEMS && !(x in S)) -> tau . reply_i_f(Tid, x) . release_s . Server(c, S + {x}, wait);
+
+	Eval(Tid: Tid, c: Nat, S: Issued, wait: GNIWait) =
+			(c > NROF_ITEMS) -> reply_i_f(Tid, NROF_ITEMS) . release_s . Server(c, S, wait)
+		<> (c <= NROF_PRODUCERS) -> PickUnissued(Tid, c, S, wait)
+		<> ((NROF_PRODUCERS < c) && (c <= NROF_ITEMS)) ->
+				( !(required(c) in S) -> reply_i_f(Tid, required(c)) . release_s . Server(c, S + {required(c)}, wait)
+				  <> PickUnissued(Tid, c, S, wait)
+				)
+		<> delta;
+
+	% GET NEXT ITEM GENERATOR FUNCTION
+	GNI = 
+	hide({acquire_gni, release_gni},
+	allow({request_i_f, reply_i_f, acquire_gni, release_gni},
+	comm({ acquire_s | acquire_r -> acquire_gni,
+	       release_s | release_r -> release_gni
+	     },
+	     Server(0, {}, {}) || ItemLock(false)
+	)));
+
+% BUFFER
+% The design is based on a 'ignorant' buffer assumption:
+% the buffer always accepts any request from consumer and producers.
+% The buffer is circular, elements are placed in modulo BUFFER_SIZE
+% Two hands dictate the position of the next put (write) and take (read)
+sort
+	Cells = List(Item);
+
+map
+	next_idx: Nat -> Nat;
+	get_at: Cells # Nat -> Item;
+	set_at: Cells # Nat # Item -> Cells;
+	init_cells: Nat -> Cells;
+
+var
+	n: Nat;
+	x,y: Item;
+	xs: Cells;
+
+eqn
+	next_idx(n) = (n + 1) mod Nat2Pos(BUFFER_SIZE);
+	
+    % Initialization
+    init_cells(n) = if(n == 0, 
+                       [], 
+                       NROF_ITEMS |> init_cells(Int2Nat(n - 1)));
+
+    % Get
+    get_at(x |> xs, n) = if(n == 0, 
+                            x, 
+                            get_at(xs, Int2Nat(n - 1)));
+
+    % Set
+    set_at(x |> xs, n, y) = if(n == 0, 
+                               y |> xs, 
+                               x |> set_at(xs, Int2Nat(n - 1), y));
+
+act
+	buf_put_b: Item;
+	buf_take_b: Item;
+
+proc
+	Circular_Buffer(write: Nat, read: Nat, mem: Cells) =
+		sum i: Item.(i < NROF_ITEMS) -> buf_put_b(i) . 
+		Circular_Buffer(next_idx(write), read, set_at(mem, write, i))
+		+
+		buf_take_b(get_at(mem, read)) . 
+		Circular_Buffer(write, next_idx(read), mem);
+	
+% COUNTER
+% The counter process maintains the current count of items in the buffer.
+act
+	incr_c;
+	decr_c;
+	read_counter_c_zero;
+	read_counter_c_nonzero;
+	read_counter_c_full;
+	read_counter_c_nonfull;
+
+proc
+	Counter(c: Nat) =
+	(c < BUFFER_SIZE) -> incr_c . Counter(c + 1)
+	+
+	(c > 0) -> decr_c . Counter(Int2Nat(c - 1))
+	+
+	(c == 0) -> read_counter_c_zero . Counter(c)
+	+
+	(c > 0) -> read_counter_c_nonzero . Counter(c)
+	+
+	(c == BUFFER_SIZE) -> read_counter_c_full . Counter(c)
+	+
+	(c < BUFFER_SIZE) -> read_counter_c_nonfull . Counter(c);
+
+
+% BUFFER MONITOR
+% The buffer monitor is responsible for granting exclusive access to the buffer
+sort
+	BufferWait = FSet(Tid);
+act
+    % Sender-side actions
+    req_b_s: Tid;
+    grant_b_s: Tid;
+    rel_req_s: Tid;
+
+    % Receiver-side actions
+    req_b_r: Tid;
+    grant_b_r: Tid;
+    rel_req_r: Tid;
+
+	acquire_b_s;
+	acquire_b_r;
+	release_b_s;
+	release_b_r;
+	acquire_b;
+	release_b;
+
+proc
+	Buffer_Lock(locked: Bool) =
+		(!locked) -> acquire_b_r . Buffer_Lock(true)
+		+ (locked)  -> release_b_r . Buffer_Lock(false);
+	
+	% The server maintains the set of waiting callers (both producers and the consumer)
+	B_Server(wait: BufferWait) =
+		  sum c: Tid. (c <= NROF_PRODUCERS && !(c in wait)) -> req_b_r(c) . B_Server(wait + {c})
+		+ (wait != {}) -> acquire_b_s . B_Grant(pick(wait), wait);
+	
+	% Grant access to a caller.
+	B_Grant(tid: Tid, wait: BufferWait) =
+		grant_b_r(tid) . B_Serving(tid, wait - {tid});
+	
+	% While a caller is being served (has exclusive access), we still accept requests
+	B_Serving(t_active: Tid, wait: BufferWait) =
+		  sum c: Tid. (c <= NROF_PRODUCERS && c != t_active && !(c in wait)) -> req_b_r(c) . B_Serving(t_active, wait + {c})
+		+ rel_req_r(t_active) . release_b_s . B_Server(wait);
+
+	% BUFFER MONITOR
+	Buffer_Monitor =
+		hide({acquire_b, release_b},
+		allow({req_b_r, grant_b_r, rel_req_r, acquire_b, release_b},
+		comm({ acquire_b_s | acquire_b_r -> acquire_b,
+		       release_b_s | release_b_r -> release_b
+		     },
+		     B_Server({}) || Buffer_Lock(false)
+		)));
+
+% CONSUMER PROCESS
+% The consumer continuously requests items from the buffer in order, as long as the buffer is not empty.
+% Since buffer underflow is forbidden. The consumer needs to wait until the count map is non zero
+% (i.e. a producer updated it). We model this behavior to mimic condition variables.
+% The consumer is enclosed in a loop, where it first acquires the buffer lock,
+% checks if the buffer is empty (buffer_count == 0), if so releases the lock and waits 
+% for a signal from a producer. Otherwise, it consumes an item 
+% (decrements buffer_count) and releases the lock. We model the sleep based waiting explicitly to 
+% avoid spinlocks.
+
+% Likewise, when the consumer obtains an item, it signals the producers
+% waiting for buffer space (if any) to wake up and produce more items.
+
+act
+	buf_take_c: Item;
+	decr_cons;
+	read_counter_cons_zero;
+	read_counter_cons_nonzero;
+	wait_NotEmpty_c;
+	signal_NotFull_c;
+map
+	consumer_tid: Tid;
+
+eqn
+	consumer_tid = NROF_PRODUCERS; % Avoid conflict with producer tids (0..NROF_PRODUCERS-1)
+
+proc
+	Consumer(extracted: Nat) =
+		(extracted < NROF_ITEMS) ->
+			req_b_s(consumer_tid) . grant_b_s(consumer_tid) .
+			(
+				read_counter_cons_zero .
+				rel_req_s(consumer_tid) .
+				wait_NotEmpty_c .
+				Consumer(extracted)
+				+
+				read_counter_cons_nonzero .
+				buf_take_c(extracted) .
+				rel_req_s(consumer_tid) .
+				decr_cons .
+				signal_NotFull_c .
+				tau .
+				print(extracted) .
+				Consumer(extracted + 1)
+			)
+		+
+		(extracted >= NROF_ITEMS) -> delta;
+
+% PRODUCER(S) PROCESS
+% we define two producers specications: broadcast-based and signal-based.
+% The first invokes a turn election subroutine, that wakes up all waiting producers
+% to compete as candidates for the next item.
+% The latter uses a lookup-table to track which producer claimed a certain item
+% when a producer updates the buffer, it then uncovers the value at the entry
+% of the next item index, if it is a valid producer tid, it signals it to wake up.
+% otherwise, it does nothing (i.e. no producer has yet claimed the next item)
+
+% BROADCAST-BASED PRODUCER
+act
+	buf_put_p: Item;
+	request_i_p: Tid;
+	reply_i_p: Tid # Item;
+	wait_NotFull_p;
+	signal_NotEmpty_p;
+	pass_s: Item;
+	pass_r: Item;
+	pass: Item;
+	incr_prod;
+	read_counter_prod_full;
+	read_counter_prod_nonfull;
+	ack_insertion_p;
+	ack_insertion_t;
+	ack_insertion;
+
+proc
+	% Turn enables exactly one next item value at a time.
+	Turn(expected: Item) =
+		(expected < NROF_ITEMS) -> pass_r(expected) . ack_insertion_t . Turn(expected + 1)
+		+
+		(expected == NROF_ITEMS) -> delta;
+
+	Producer(tid: Tid) =
+		request_i_p(tid) .
+		sum job_x: Item. (job_x <= NROF_ITEMS) ->
+			reply_i_p(tid, job_x) .
+			(
+				(job_x == NROF_ITEMS) -> delta
+				<>
+				(job_x < NROF_ITEMS) ->
+					pass_s(job_x) .
+					Producer_BufferTry(tid, job_x)
+			);
+
+	Producer_BufferTry(tid: Tid, job_x: Item) =
+		req_b_s(tid) . grant_b_s(tid) .
+		(
+			read_counter_prod_full .
+			rel_req_s(tid) .
+			wait_NotFull_p .
+			Producer_BufferTry(tid, job_x)
+			+
+			read_counter_prod_nonfull .
+			tau .
+			buf_put_p(job_x) .
+			incr_prod .
+			rel_req_s(tid) .
+			signal_NotEmpty_p .
+			ack_insertion_p .
+			Producer(tid)
+		);
+
+	Broadcast_P =
+		hide({pass, ack_insertion},
+		allow({request_i_p, reply_i_p, req_b_s, grant_b_s, rel_req_s, buf_put_p, wait_NotFull_p, signal_NotEmpty_p,
+		incr_prod, read_counter_prod_full, read_counter_prod_nonfull, pass, ack_insertion},
+		comm({ pass_s | pass_r -> pass,
+			   ack_insertion_t | ack_insertion_p -> ack_insertion
+			},
+		     Producer(0) || Producer(1) || Turn(0)
+		)));
+
+
+% COMMUNICATION PROCESSES
+
+% Producers - GNI function
+act
+	request_i: Tid;
+	reply_i: Tid # Item;
+proc
+	P_GNI =
+		hide({request_i, reply_i},
+		allow({request_i, reply_i, pass, ack_insertion,
+		req_b_s, grant_b_s, rel_req_s, buf_put_p, wait_NotFull_p, signal_NotEmpty_p,
+		incr_prod, read_counter_prod_full, read_counter_prod_nonfull,
+		% GNI server actions
+		acquire_gni, release_gni
+		},
+		comm({ request_i_f | request_i_p -> request_i,
+		       reply_i_f | reply_i_p -> reply_i
+		     },
+		     GNI || Broadcast_P
+		)));
+
+% COUNTER, PRODUCER and CONSUMER
+act
+	decr;
+	incr;
+	read_counter_zero;
+	read_counter_nonzero;
+	read_counter_full;
+	read_counter_nonfull;
+	NotEmpty;
+	NotFull;
+proc
+	P_B_Counter =
+		hide({decr, incr, read_counter_zero, read_counter_nonzero, read_counter_full, read_counter_nonfull, NotEmpty, NotFull, signal_NotEmpty_p, signal_NotFull_c},
+		allow({print, decr, incr, read_counter_zero, read_counter_nonzero, read_counter_full, read_counter_nonfull,
+		req_b_s, grant_b_s, rel_req_s, buf_put_p, buf_take_c, NotEmpty, NotFull,
+	    % P_GNI actions
+		request_i, reply_i, pass, ack_insertion, acquire_gni, release_gni,
+		% Signal actions
+		signal_NotEmpty_p, signal_NotFull_c
+		 },
+		 comm({ incr_prod | incr_c -> incr,
+		        decr_cons | decr_c -> decr,
+		        read_counter_prod_full | read_counter_c_full -> read_counter_full,
+		        read_counter_prod_nonfull | read_counter_c_nonfull -> read_counter_nonfull,
+		        read_counter_cons_zero | read_counter_c_zero -> read_counter_zero,
+		        read_counter_cons_nonzero | read_counter_c_nonzero -> read_counter_nonzero,
+				signal_NotEmpty_p | wait_NotEmpty_c -> NotEmpty,
+				signal_NotFull_c | wait_NotFull_p -> NotFull
+		     },
+		     P_GNI || Counter(0) || Consumer(0)
+		 )));
+
+% P_B_Counter - BUFFER MONITOR - CIRCULAR BUFFER
+act
+	buf_put: Item;
+	buf_take: Item;
+	req_b: Tid;
+	grant_b: Tid;
+	rel_req: Tid;
+proc 
+	System =
+		hide({req_b, grant_b, rel_req, buf_put, buf_take, signal_NotEmpty_p, signal_NotFull_c},
+		allow({print, req_b, grant_b, rel_req, buf_put, buf_take,
+		% P_B_Counter actions
+		decr, incr, read_counter_zero, read_counter_nonzero, read_counter_full, read_counter_nonfull, NotEmpty, NotFull,
+		% P_GNI actions
+		request_i, reply_i, pass, ack_insertion, acquire_gni, release_gni,
+		% Buffer_Monitor actions
+		acquire_b, release_b,
+		% Signal actions
+		signal_NotEmpty_p, signal_NotFull_c
+		},
+		comm({ buf_put_p | buf_put_b -> buf_put,
+		       buf_take_c | buf_take_b -> buf_take,
+			   req_b_s | req_b_r -> req_b,
+			   grant_b_s | grant_b_r -> grant_b,
+			   rel_req_s | rel_req_r -> rel_req
+		     },
+		     P_B_Counter || 
+			 Buffer_Monitor || Circular_Buffer(0, 0, init_cells(BUFFER_SIZE))
+		)));
+
+
+init System || Print_Order(0);
