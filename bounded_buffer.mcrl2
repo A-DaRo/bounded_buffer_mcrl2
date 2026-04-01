@@ -225,6 +225,51 @@ proc
 		     B_Server({}) || Buffer_Lock(false)
 		)));
 
+% CONSUMER-PRODUCER CONDITION VARIABLES MONITORS
+
+act
+	sleep_NotEmpty_r;
+	signal_NotEmpty_r;
+	release_NotEmpty_r;
+	sleep_NotFull_r;
+	signal_NotFull_r;
+	release_NotFull_r;
+	sleep_NotEmpty_s;
+	signal_NotEmpty_s;
+	release_NotEmpty_s;
+	sleep_NotFull_s;
+	signal_NotFull_s;
+	release_NotFull_s;
+  
+proc
+	% NotEmpty monitor
+	CV_NotEmpty(waiting: Bool) =
+		sleep_NotEmpty_r . 
+		CV_NotEmpty(true)
+		+
+		(!waiting) -> 
+		signal_NotEmpty_r . 
+		CV_NotEmpty(waiting)
+		+
+		(waiting) -> 
+		signal_NotEmpty_r . 
+		release_NotEmpty_s . 
+		CV_NotEmpty(false);
+
+  	% NotFull monitor
+  	CV_NotFull(waiting: Bool) =
+		sleep_NotFull_r . 
+		CV_NotFull(true)
+		+
+		(!waiting) -> 
+		signal_NotFull_r . 
+		CV_NotFull(waiting)
+		+
+		(waiting) -> 
+		signal_NotFull_r . 
+		release_NotFull_s . 
+		CV_NotFull(false);
+
 % CONSUMER PROCESS
 % The consumer continuously requests items from the buffer in order, as long as the buffer is not empty.
 % Since buffer underflow is forbidden. The consumer needs to wait until the count map is non zero
@@ -243,8 +288,7 @@ act
 	decr_cons;
 	read_counter_cons_zero;
 	read_counter_cons_nonzero;
-	wait_NotEmpty_c;
-	signal_NotFull_c;
+
 map
 	consumer_tid: Tid;
 
@@ -258,20 +302,22 @@ proc
 			(
 				read_counter_cons_zero .
 				rel_req_s(consumer_tid) .
-				wait_NotEmpty_c .
+				sleep_NotEmpty_s .
+				release_NotEmpty_r .
 				Consumer(extracted)
 				+
 				read_counter_cons_nonzero .
 				buf_take_c(extracted) .
-				rel_req_s(consumer_tid) .
 				decr_cons .
-				signal_NotFull_c .
+				signal_NotFull_s .
+				rel_req_s(consumer_tid) .
 				tau .
 				print(extracted) .
 				Consumer(extracted + 1)
 			)
 		+
 		(extracted >= NROF_ITEMS) -> delta;
+
 
 % PRODUCER(S) PROCESS
 % we define two producers specications: broadcast-based and signal-based.
@@ -285,32 +331,30 @@ proc
 % register entries in signal solution
 sort
 	CoordEntry = struct ce(item: Item, owner: Tid);
+	PBWait = FSet(Tid);
 act
 	buf_put_p: Item;
 	request_i_p: Tid;
 	reply_i_p: Tid # Item;
-	wait_NotFull_p;
-	signal_NotEmpty_p;
-	pass_s: Item;
-	pass_r: Item;
-	pass: Item;
+	pb_sleep_s, pb_sleep_r, pb_sleep: Tid;
+  	pb_bcast_s, pb_bcast_r, pb_bcast: Tid;
+	pb_resume_s, pb_resume_r, pb_resume: Tid;
+	wait_PS_t, signal_PS_t, signal_cv_t: Tid;
+	turn_s_i, turn_r_i, turn_i: Item;
+	turn_ack_s, turn_ack_r, turn_ack: Item;
+	turn_nack_s, turn_nack_r, turn_nack: Item;
+	set_flush_r, set_flush_s, set_flush;
+	lookup_coord_s, lookup_coord_r, lookup_coord: Item;
+	lookup_sig_s, lookup_sig_r, lookup_sig: Tid;
+	lookup_fail_s, lookup_fail_r, lookup_fail;
 	incr_prod;
-	read_counter_prod_full;
-	read_counter_prod_nonfull;
-	ack_insertion_s;
-	ack_insertion_r;
-	ack_insertion;
+	read_counter_prod_full, read_counter_prod_nonfull;
+	ack_guard_s, ack_guard_r, ack_guard;
 	reg_coord_r, reg_coord_s, reg_coord: CoordEntry;
 	coord_sig_r, coord_sig_s, coord_sig: CoordEntry;
 
 proc
 	% BROADCAST-BASED PRODUCER
-	% Turn enables exactly one next item value at a time.
-	Turn(expected: Item) =
-		(expected < NROF_ITEMS) -> pass_r(expected) . ack_insertion_r . Turn(expected + 1)
-		+
-		(expected == NROF_ITEMS) -> delta;
-
 	Producer_broadcast(tid: Tid) =
 		request_i_p(tid) .
 		sum job_x: Item. (job_x <= NROF_ITEMS) ->
@@ -319,29 +363,119 @@ proc
 				(job_x == NROF_ITEMS) -> delta
 				<>
 				(job_x < NROF_ITEMS) ->
-					pass_s(job_x) .
-					Producer_BufferTry(tid, job_x, true)
+					tau .
+					% enter critical section
+					Broadcast_Crit(tid, job_x)
 			);
 
-	% SIGNAL-BASED PRODUCER
-	% Coord subroutine registers mappings and signals turn
-	Coord(e: Item, O: FSet(CoordEntry)) =
-		(e == NROF_ITEMS) -> delta
-		<>
-		(e < NROF_ITEMS) ->
-			(
-				sum x: Item, i: Tid.
-				(x < NROF_ITEMS && i < NROF_PRODUCERS) ->
-					reg_coord_r(ce(x, i)) .
-					Coord(e, O + {ce(x, i)})
-				+
-				sum i: Tid.
-				(ce(e, i) in O) ->
-					coord_sig_s(ce(e, i)) .
-					ack_insertion_r .
-					Coord(e + 1, O - {ce(e, i)})
-			);
+	% Broadcast monitor keeps a set of currently waiting producers.
+  	% On broadcast by t_b, all waiting producers except t_b are woken atomically (once).
+  	PB_Monitor(wait: PBWait) =
+        sum t: Tid. (t < NROF_PRODUCERS && !(t in wait)) ->
+          pb_sleep_r(t) . PB_Monitor(wait + {t})
+      	+ 
+		sum t_b: Tid. (t_b < NROF_PRODUCERS) ->
+          pb_bcast_r(t_b) . PB_WakeAll(wait);
 	
+	PB_WakeAll(wait: PBWait) =
+		(wait == {}) -> PB_Monitor({})
+	  <>
+		sum t: Tid. (t < NROF_PRODUCERS && t in wait) ->
+		  pb_resume_r(t) . PB_WakeAll(wait - {t});
+	
+	% Turn guard enables exactly one next item value at a time.
+	Turn_Guard(expected: Item) =
+		(expected == NROF_ITEMS) -> delta
+		<>
+		(expected < NROF_ITEMS) -> 
+			sum i: Item. (i < NROF_ITEMS) ->
+				(
+					(i == expected) ->
+						turn_r_i(i) .
+						turn_ack_s(i) .
+						( 
+							set_flush_r .
+							Turn_Guard(expected) % buffer full, retry
+							+
+							ack_guard_r . 
+							Turn_Guard(expected + 1)
+						)
+					+
+					(i != expected) ->
+						turn_r_i(i) .
+						turn_nack_s(i) . 
+						Turn_Guard(expected)
+				);
+
+	Broadcast_Crit(tid: Tid, i: Item) =
+		req_b_s(tid) . grant_b_s(tid) .
+		turn_s_i(i) .
+		(
+		turn_ack_r(i) .
+		(
+			read_counter_prod_full .
+			(
+				rel_req_s(tid) .
+				sleep_NotFull_s .
+				release_NotFull_r .
+				set_flush_s .
+				Broadcast_Crit(tid, i)
+			)
+			+
+			read_counter_prod_nonfull .
+			(	
+				tau .
+				buf_put_p(i) .
+				incr_prod .
+				signal_NotEmpty_s .
+				rel_req_s(tid) .
+				ack_guard_s .
+				pb_bcast_s(tid) .
+				Producer_broadcast(tid)
+			)
+		)
+		+
+		turn_nack_r(i) . 
+			(
+			rel_req_s(tid) .
+			pb_sleep_s(tid) .
+			pb_resume_s(tid) .
+			Broadcast_Crit(tid, i)
+			)
+		);
+
+	% BROADCAST SOLUTION ENTRY-POINT
+	Broadcast_P =
+	  hide({
+	  turn_i, ack_guard, turn_ack, turn_nack,
+	  set_flush, pb_sleep, pb_resume, pb_bcast
+	  },
+	  allow({
+	    request_i_p, reply_i_p,
+	    req_b_s, grant_b_s, rel_req_s, buf_put_p,
+	    sleep_NotFull_s, signal_NotEmpty_s,
+		release_NotFull_r,
+	    incr_prod, read_counter_prod_full, 
+		read_counter_prod_nonfull,
+	    turn_i, ack_guard, turn_ack, turn_nack, set_flush,
+	    pb_sleep, pb_resume, pb_bcast
+	  },
+	  comm({ turn_r_i | turn_s_i -> turn_i,
+	         turn_ack_r | turn_ack_s -> turn_ack,
+	         turn_nack_r | turn_nack_s -> turn_nack,
+	         ack_guard_r | ack_guard_s -> ack_guard,
+	         set_flush_r | set_flush_s -> set_flush,
+	         pb_sleep_s | pb_sleep_r -> pb_sleep,
+	         pb_resume_s | pb_resume_r -> pb_resume,
+	         pb_bcast_s | pb_bcast_r -> pb_bcast
+	       },
+	       Producer_broadcast(0)
+	       || Producer_broadcast(1)
+	       || Turn_Guard(0)
+	       || PB_Monitor({})
+	  )));
+
+	% SIGNAL-BASED PRODUCER	
 	Producer_signal(tid: Tid) =
 		request_i_p(tid) .
 		sum job_x: Item. (job_x <= NROF_ITEMS) ->
@@ -351,53 +485,134 @@ proc
 				<>
 				(job_x < NROF_ITEMS) ->
 					reg_coord_s(ce(job_x, tid)) .
-					coord_sig_r(ce(job_x, tid)) .
-					Producer_BufferTry(tid, job_x, false)
+					Signal_Crit(tid, job_x)
 			);
-		
-	Producer_BufferTry(tid: Tid, job_x: Item, broadcast: Bool) =
+
+	% Coord subroutine registers mappings
+	% provides signal interface
+	% serves turn value when signal is not possible
+	Coord_Guard(e: Item, O: FSet(CoordEntry)) =
+		(e == NROF_ITEMS) -> delta
+		<>
+		(e < NROF_ITEMS) ->
+			(
+				% register owner
+				sum x: Item, i: Tid.
+				(x < NROF_ITEMS && i < NROF_PRODUCERS) ->
+					reg_coord_r(ce(x, i)) .
+					Coord_Guard(e, O + {ce(x, i)})
+				+
+				% signal interface
+				lookup_coord_r(e) .
+				(
+					sum t: Tid. (t <= NROF_PRODUCERS) ->
+						(
+							(t < NROF_PRODUCERS && ce(e, t) in O) ->
+								lookup_sig_s(t) .
+								Coord_Guard(e, O - {ce(e, t)})
+							+
+							(t == NROF_PRODUCERS) ->
+								lookup_fail_s .
+								Coord_Guard(e, O)
+						)
+				)
+				+
+				% serve turn value
+				sum i: Item. (i < NROF_ITEMS) ->
+				(
+					(i == e) ->
+						turn_r_i(i) .
+						turn_ack_s(i) . 
+						(
+							set_flush_r .
+							Coord_Guard(e, O)
+							+
+							ack_guard_r . 
+							(
+							sum t: Tid. 
+							(t < NROF_PRODUCERS && ce(e, t) in O) ->
+								Coord_Guard(e + 1, O - {ce(e, t)})
+							)
+						)
+					+
+					(i != e) ->
+						turn_r_i(i) .
+						turn_nack_s(i) . 
+						Coord_Guard(e, O)
+				)
+			);
+
+	Signal_Crit(tid: Tid, i: Item) =
 		req_b_s(tid) . grant_b_s(tid) .
+		turn_s_i(i) .
+		(
+		turn_ack_r(i) .
 		(
 			read_counter_prod_full .
-			rel_req_s(tid) .
-			wait_NotFull_p .
-			Producer_BufferTry(tid, job_x, broadcast)
+			(
+				rel_req_s(tid) .
+				sleep_NotFull_s .
+				release_NotFull_r .
+				set_flush_s .
+				Signal_Crit(tid, i)
+			)
 			+
 			read_counter_prod_nonfull .
-			tau .
-			buf_put_p(job_x) .
-			incr_prod .
+			(	
+				tau .
+				buf_put_p(i) .
+				incr_prod .
+				signal_NotEmpty_s .
+				rel_req_s(tid) .
+				ack_guard_s .
+				lookup_coord_s(i+1).
+				(
+					sum t: Tid. (t < NROF_PRODUCERS && t != tid) ->
+						(
+							lookup_sig_r(t) .
+							signal_PS_t(t) .
+							Producer_signal(tid)
+						)
+					+
+					lookup_fail_r .
+					Producer_signal(tid)
+				)
+			)
+		)
+		+
+		turn_nack_r(i) . 
+			(
 			rel_req_s(tid) .
-			signal_NotEmpty_p .
-			ack_insertion_s .
-			(broadcast) -> Producer_broadcast(tid) 
-			<>
-			(!broadcast) -> Producer_signal(tid)
+			wait_PS_t(tid) .
+			Signal_Crit(tid, i)
+			)
 		);
-
-	% BROADCAST SOLUTION ENTRY-POINT
-	Broadcast_P =
-		hide({pass, ack_insertion},
-		allow({request_i_p, reply_i_p, req_b_s, grant_b_s, rel_req_s, buf_put_p, wait_NotFull_p, signal_NotEmpty_p,
-		incr_prod, read_counter_prod_full, read_counter_prod_nonfull, pass, ack_insertion},
-		comm({ pass_s | pass_r -> pass,
-			   ack_insertion_r | ack_insertion_s -> ack_insertion
-			},
-		     Producer_broadcast(0) || Producer_broadcast(1) || Turn(0)
-		)));
 
 	% SIGNAL SOLUTION ENTRY-POINT
 	Signal_P =
-		hide({reg_coord, coord_sig, ack_insertion},
-		allow({request_i_p, reply_i_p, req_b_s, grant_b_s, rel_req_s, buf_put_p, wait_NotFull_p, signal_NotEmpty_p,
+		hide({reg_coord, ack_guard, turn_i, turn_ack, turn_nack, set_flush, lookup_coord, lookup_sig, lookup_fail, signal_cv_t},
+		allow({
+		request_i_p, reply_i_p, req_b_s,
+		grant_b_s, rel_req_s, buf_put_p,
+		sleep_NotFull_s, signal_NotEmpty_s,
+		release_NotFull_r,
 		incr_prod, read_counter_prod_full, read_counter_prod_nonfull,
-		reg_coord, coord_sig, ack_insertion
+		reg_coord, ack_guard, turn_i, 
+		turn_ack, turn_nack, set_flush, 
+		lookup_coord, lookup_sig, lookup_fail, signal_cv_t
 		},
 		comm({ reg_coord_r | reg_coord_s -> reg_coord,
-			   coord_sig_r | coord_sig_s -> coord_sig,
-			   ack_insertion_r | ack_insertion_s -> ack_insertion
+			   turn_r_i | turn_s_i -> turn_i,
+			   turn_ack_r | turn_ack_s -> turn_ack,
+			   turn_nack_r | turn_nack_s -> turn_nack,
+			   ack_guard_r | ack_guard_s -> ack_guard,
+			   set_flush_r | set_flush_s -> set_flush,
+			   lookup_coord_r | lookup_coord_s -> lookup_coord,
+			   lookup_sig_r | lookup_sig_s -> lookup_sig,
+			   lookup_fail_r | lookup_fail_s -> lookup_fail,
+			   wait_PS_t | signal_PS_t -> signal_cv_t
 			},
-		     Producer_signal(0) || Producer_signal(1) || Coord(0, {})
+		     Producer_signal(0) || Producer_signal(1) || Coord_Guard(0, {})
 		)));
 
 
@@ -410,7 +625,10 @@ act
 proc
 	P_GNI_B =
 		hide({request_i, reply_i},
-		allow({request_i, reply_i, req_b_s, grant_b_s, rel_req_s, buf_put_p, wait_NotFull_p, signal_NotEmpty_p,
+		allow({
+		% Producers actions (broadcst)
+		request_i, reply_i, req_b_s, grant_b_s, rel_req_s, 
+		buf_put_p, sleep_NotFull_s, signal_NotEmpty_s, release_NotFull_r,
 		incr_prod, read_counter_prod_full, read_counter_prod_nonfull,
 		% GNI server actions
 		acquire_gni, release_gni
@@ -423,7 +641,10 @@ proc
 
 	P_GNI_S =
 		hide({request_i, reply_i},
-		allow({request_i, reply_i, req_b_s, grant_b_s, rel_req_s, buf_put_p, wait_NotFull_p, signal_NotEmpty_p,
+		allow({
+		% Producers actions (signal)
+		request_i, reply_i, req_b_s, grant_b_s, rel_req_s,
+		buf_put_p, sleep_NotFull_s, signal_NotEmpty_s, release_NotFull_r,
 		incr_prod, read_counter_prod_full, read_counter_prod_nonfull,
 		% GNI server actions
 		acquire_gni, release_gni
@@ -442,45 +663,75 @@ act
 	read_counter_nonzero;
 	read_counter_full;
 	read_counter_nonfull;
-	NotEmpty;
-	NotFull;
+	SleepNotEmpty;
+	SignalNotEmpty;
+	ReleaseNotEmpty;
+	SleepNotFull;
+	SignalNotFull;
+	ReleaseNotFull;
 proc
 	P_B_Counter_B =
-		hide({decr, incr, read_counter_zero, read_counter_nonzero, read_counter_full, read_counter_nonfull, NotEmpty, NotFull, signal_NotEmpty_p, signal_NotFull_c},
-		allow({print, decr, incr, read_counter_zero, read_counter_nonzero, read_counter_full, read_counter_nonfull,
-		req_b_s, grant_b_s, rel_req_s, buf_put_p, buf_take_c, NotEmpty, NotFull,
-	    % Signal actions
-		signal_NotEmpty_p, signal_NotFull_c
-		 },
+		hide({
+		decr, incr, read_counter_zero, read_counter_nonzero,
+		read_counter_full, read_counter_nonfull, 
+		SleepNotEmpty, SignalNotEmpty, ReleaseNotEmpty,
+		SleepNotFull, SignalNotFull, ReleaseNotFull},
+		allow({
+		% Print action
+		print,
+		decr, incr, read_counter_zero, read_counter_nonzero,
+		read_counter_full, read_counter_nonfull,
+		req_b_s, grant_b_s, rel_req_s, buf_put_p, 
+		buf_take_c, SleepNotEmpty, 
+		SignalNotEmpty, ReleaseNotEmpty,
+		SleepNotFull, SignalNotFull, ReleaseNotFull
+		},
 		 comm({ incr_prod | incr_c -> incr,
 		        decr_cons | decr_c -> decr,
 		        read_counter_prod_full | read_counter_c_full -> read_counter_full,
 		        read_counter_prod_nonfull | read_counter_c_nonfull -> read_counter_nonfull,
 		        read_counter_cons_zero | read_counter_c_zero -> read_counter_zero,
 		        read_counter_cons_nonzero | read_counter_c_nonzero -> read_counter_nonzero,
-				signal_NotEmpty_p | wait_NotEmpty_c -> NotEmpty,
-				signal_NotFull_c | wait_NotFull_p -> NotFull
+				sleep_NotEmpty_s | sleep_NotEmpty_r -> SleepNotEmpty,
+				signal_NotEmpty_s | signal_NotEmpty_r -> SignalNotEmpty,
+				release_NotEmpty_s | release_NotEmpty_r -> ReleaseNotEmpty,
+				sleep_NotFull_s | sleep_NotFull_r -> SleepNotFull,
+				signal_NotFull_s | signal_NotFull_r -> SignalNotFull,
+				release_NotFull_s | release_NotFull_r -> ReleaseNotFull
 		     },
-		     P_GNI_B || Counter(0) || Consumer(0)
+		     P_GNI_B || Counter(0) || Consumer(0) || CV_NotEmpty(false) || CV_NotFull(false)
 		 )));
 
 	P_B_Counter_S =
-		hide({decr, incr, read_counter_zero, read_counter_nonzero, read_counter_full, read_counter_nonfull, NotEmpty, NotFull, signal_NotEmpty_p, signal_NotFull_c},
-		allow({print, decr, incr, read_counter_zero, read_counter_nonzero, read_counter_full, read_counter_nonfull,
-		req_b_s, grant_b_s, rel_req_s, buf_put_p, buf_take_c, NotEmpty, NotFull,
-	    % Signal actions
-		signal_NotEmpty_p, signal_NotFull_c
-		 },
+		hide({
+		decr, incr, read_counter_zero, read_counter_nonzero,
+		read_counter_full, read_counter_nonfull, 
+		SleepNotEmpty, SignalNotEmpty, ReleaseNotEmpty,
+		SleepNotFull, SignalNotFull, ReleaseNotFull},
+		allow({
+		% Print action
+		print,
+		decr, incr, read_counter_zero, read_counter_nonzero,
+		read_counter_full, read_counter_nonfull,
+		req_b_s, grant_b_s, rel_req_s, buf_put_p, 
+		buf_take_c, SleepNotEmpty,
+		SignalNotEmpty, ReleaseNotEmpty,
+		SleepNotFull, SignalNotFull, ReleaseNotFull
+		},
 		 comm({ incr_prod | incr_c -> incr,
 		        decr_cons | decr_c -> decr,
 		        read_counter_prod_full | read_counter_c_full -> read_counter_full,
 		        read_counter_prod_nonfull | read_counter_c_nonfull -> read_counter_nonfull,
 		        read_counter_cons_zero | read_counter_c_zero -> read_counter_zero,
 		        read_counter_cons_nonzero | read_counter_c_nonzero -> read_counter_nonzero,
-				signal_NotEmpty_p | wait_NotEmpty_c -> NotEmpty,
-				signal_NotFull_c | wait_NotFull_p -> NotFull
+				sleep_NotEmpty_s | sleep_NotEmpty_r -> SleepNotEmpty,
+				signal_NotEmpty_s | signal_NotEmpty_r -> SignalNotEmpty,
+				release_NotEmpty_s | release_NotEmpty_r -> ReleaseNotEmpty,
+				sleep_NotFull_s | sleep_NotFull_r -> SleepNotFull,
+				signal_NotFull_s | signal_NotFull_r -> SignalNotFull,
+				release_NotFull_s | release_NotFull_r -> ReleaseNotFull
 		     },
-		     P_GNI_S || Counter(0) || Consumer(0)
+		     P_GNI_S || Counter(0) || Consumer(0) || CV_NotEmpty(false) || CV_NotFull(false)
 		 )));
 
 % P_B_Counter - BUFFER MONITOR - CIRCULAR BUFFER
@@ -518,4 +769,4 @@ proc
 		)));
 
 % Use System_B for broadcast and System_S for signal.
-init System_S || Print_Order(0);
+init System_S;
