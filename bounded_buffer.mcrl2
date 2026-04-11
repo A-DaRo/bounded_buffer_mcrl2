@@ -1,5 +1,6 @@
 % In this bounded buffer exercise we are requested to model a system with P producers and one consumer.
-% The buffer has a fixed size B. Items are expected to be processed in order, i.e. no item at the bottom of the buffer can be higher than the above.
+% The buffer has a fixed size B. Items are expected to be processed in order, 
+% i.e. no item at the bottom of the buffer can be higher than the above.
 % Producers obtain items from a `get_next_item` function modelled to always yield a distinct item and
 % if at iteration c-P the current c lowest item has not being yield, the function returns it.
 
@@ -25,13 +26,14 @@ var
 	c: Nat;
 
 eqn
-	NROF_ITEMS = 3;
-	NROF_PRODUCERS = 2;
-	BUFFER_SIZE = 2;
+	NROF_ITEMS = 2;
+	NROF_PRODUCERS = 1;
+	BUFFER_SIZE = 1;
 
-	% The fairness rule's required job when c > NROF_PRODUCERS.
-	(c > NROF_PRODUCERS) -> required(c) = Int2Nat(c - NROF_PRODUCERS);
-	(c <= NROF_PRODUCERS) -> required(c) = 0;
+	% Fairness target index:
+	% active from c >= NROF_PRODUCERS
+	(c >= NROF_PRODUCERS) -> required(c) = Int2Nat(c - NROF_PRODUCERS);
+	(c <  NROF_PRODUCERS) -> required(c) = 0;
 
 
 % --------------
@@ -83,8 +85,8 @@ proc
 
 	Eval(Tid: Tid, c: Nat, S: Issued, wait: GNIWait) =
 			(c > NROF_ITEMS) -> reply_i_f(Tid, NROF_ITEMS) . release_s . Server(c, S, wait)
-		<> (c <= NROF_PRODUCERS) -> PickUnissued(Tid, c, S, wait)
-		<> ((NROF_PRODUCERS < c) && (c <= NROF_ITEMS)) ->
+		<> (c < NROF_PRODUCERS) -> PickUnissued(Tid, c, S, wait)
+		<> ((NROF_PRODUCERS <= c) && (c <= NROF_ITEMS)) ->
 				( !(required(c) in S) -> reply_i_f(Tid, required(c)) . release_s . Server(c, S + {required(c)}, wait)
 				  <> PickUnissued(Tid, c, S, wait)
 				)
@@ -470,7 +472,6 @@ proc
 	         pb_bcast_s | pb_bcast_r -> pb_bcast
 	       },
 	       Producer_broadcast(0)
-	       || Producer_broadcast(1)
 	       || Turn_Guard(0)
 	       || PB_Monitor({})
 	  )));
@@ -504,18 +505,7 @@ proc
 				+
 				% signal interface
 				lookup_coord_r(e) .
-				(
-					sum t: Tid. (t <= NROF_PRODUCERS) ->
-						(
-							(t < NROF_PRODUCERS && ce(e, t) in O) ->
-								lookup_sig_s(t) .
-								Coord_Guard(e, O - {ce(e, t)})
-							+
-							(t == NROF_PRODUCERS) ->
-								lookup_fail_s .
-								Coord_Guard(e, O)
-						)
-				)
+				Lookup_Handler(e, O)
 				+
 				% serve turn value
 				sum i: Item. (i < NROF_ITEMS) ->
@@ -541,6 +531,21 @@ proc
 						Coord_Guard(e, O)
 				)
 			);
+
+	% Lookup interface for signal management
+	Lookup_Handler(e: Item, O: FSet(CoordEntry)) =
+		(O == {}) ->
+			lookup_fail_s . Coord_Guard(e, O)
+		<>
+			sum ce_entry: CoordEntry. (ce_entry in O) ->
+				(
+					(item(ce_entry) == e) ->
+						lookup_sig_s(owner(ce_entry)) .
+						Coord_Guard(e, O - {ce_entry})
+					<>
+						tau .
+						Lookup_Handler(e, O - {ce_entry})
+				);
 
 	Signal_Crit(tid: Tid, i: Item) =
 		req_b_s(tid) . grant_b_s(tid) .
@@ -612,7 +617,7 @@ proc
 			   lookup_fail_r | lookup_fail_s -> lookup_fail,
 			   wait_PS_t | signal_PS_t -> signal_cv_t
 			},
-		     Producer_signal(0) || Producer_signal(1) || Coord_Guard(0, {})
+		     Producer_signal(0) || Coord_Guard(0, {})
 		)));
 
 
